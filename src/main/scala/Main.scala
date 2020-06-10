@@ -1,9 +1,13 @@
 import java.io.{File, PrintWriter}
+import java.lang
 import java.util.Properties
 
+import com.yahoo.labs.samoa.instances.{Instance, InstancesHeader}
+import moa.MOAObject
 import moa.core.{Example, InstanceExample}
 import moa.options.ClassOption
-import moa.streams.{ArffFileStream, ConceptDriftStream, ExampleStream}
+import moa.streams.generators.RandomTreeGenerator
+import moa.streams.{ArffFileStream, ConceptDriftStream, ExampleStream, InstanceStream}
 import picocli.CommandLine
 import picocli.CommandLine.{Option, Parameters}
 import org.apache.kafka.clients.producer.{KafkaProducer, Producer}
@@ -11,24 +15,27 @@ import org.apache.kafka.common.serialization.LongSerializer
 import org.apache.kafka.common.serialization.StringSerializer
 import org.apache.kafka.clients.producer.ProducerRecord
 
-class Main extends Runnable{
+class Main extends Runnable {
 
-  @Option(names = Array("-f"),  paramLabel = "PATH" , description = Array("Read stream from the specified file"))
+  @Option(names = Array("-f"), paramLabel = "PATH", description = Array("Read stream from the specified file"))
   var FILE: String = ""
 
-  @Option(names = Array("-s"),  paramLabel = "METHOD" , description = Array("The stream generator"))
+  @Option(names = Array("-c"), paramLabel = "NUMBER", description = Array("The index of the class column for file streams. The default, -1, means the last column as the class value"))
+  var CLASS_INDEX: Int = -1
+
+  @Option(names = Array("-s"), paramLabel = "METHOD", description = Array("The stream generator"))
   var STREAM: String = "ConceptDriftStream"
 
-  @Option(names = Array("-g"), split=",",  paramLabel = "GEN1,Gen2" , description = Array("A comma-separated list with the MOA CLI lines corresponding to the generator(s) to be employed"))
+  @Option(names = Array("-g"), split = ",", paramLabel = "GEN1,Gen2", description = Array("A comma-separated list with the MOA CLI lines corresponding to the generator(s) to be employed"))
   var GENERATORS = Array("generators.RandomTreeGenerator", "generators.RandomTreeGenerator")
 
-  @Option(names = Array("-n"),  paramLabel = "NUMBER" , description = Array("The maximum number of instances to be generated. Default: 10.000.000"))
+  @Option(names = Array("-n"), paramLabel = "NUMBER", description = Array("The maximum number of instances to be generated. Default: 10.000.000"))
   var MAX_INSTANCES: Int = 1E7.toInt
 
-  @Option(names = Array("-p"),  paramLabel = "NUMBER" , description = Array("Position where the drift occur, i.e., every X instances, a drift happen. Default: 250.000 instances"))
+  @Option(names = Array("-p"), paramLabel = "NUMBER", description = Array("Position where the drift occur, i.e., every X instances, a drift happen. Default: 250.000 instances"))
   var DRIFT_CENTER: Int = 250000
 
-  @Option(names = Array("-w"),  paramLabel = "NUMBER" , description = Array("For gradual drifts, the amount of instances in the transition between generators. Default 10.000 instances"))
+  @Option(names = Array("-w"), paramLabel = "NUMBER", description = Array("For gradual drifts, the amount of instances in the transition between generators. Default 10.000 instances"))
   var DRIFT_WIDTH: Int = 10000
 
   @Option(names = Array("--abrupt"), description = Array("The drift is abrupt instead of gradual"))
@@ -59,62 +66,80 @@ class Main extends Runnable{
     props.put("client.id", CLIENT_ID)
     //props.put("num.partitions", NUM_PARTITIONS)
 
+    // Create the producer with the given properties
     val producer: Producer[Long, String] = new KafkaProducer[Long, String](props)
+    var instancesSent = 0
 
+    // Create the stream
+    val stream: InstanceStream = if (FILE equals "") {
 
+      // Generate a Concept Drift stream (By now, only concept drift stream is supported
+      if (STREAM equals "ConceptDriftStream") {
+        val s = new ConceptDriftStream
+        s.driftstreamOption.setValueViaCLIString(GENERATORS(0)) // Stream 1
+        s.streamOption.setValueViaCLIString(GENERATORS(1)) // Stream 2
+        s.positionOption.setValue(DRIFT_CENTER) // Position where the drift happen (every x instances)
+        if (abrupt) {
+          s.widthOption.setValue(1) // The width of the change window (for abrupt drift, set to 1)
+        } else {
+          s.widthOption.setValue(DRIFT_WIDTH)
+        }
 
-    if(! (FILE equals "")){
-      val stream = new ArffFileStream()
+        s.prepareForUse()
+        s
+      } else {
+        // Generate another Moa-Supported Stream
+        val s: InstanceStream = STREAM match {
+          case "RandomTree" => {
+            new RandomTreeGenerator()
+          }
+          case _ => {
+            throw new Exception
+          }
+        }
+        s
+      }
 
     } else {
-      var instancesSent = 0
+      // If -f option is available, read the stream from a file.
+      val s = new ArffFileStream(FILE, CLASS_INDEX)
+      s.prepareForUse()
+      s
+    }
 
-      val stream = new ConceptDriftStream
-      stream.driftstreamOption.setValueViaCLIString(GENERATORS(0))    // Stream 1
-      stream.streamOption.setValueViaCLIString(GENERATORS(1))         // Stream 2
-      stream.positionOption.setValue(DRIFT_CENTER)         // Position where the drift happen (every x instances)
-      if(abrupt) {
-        stream.widthOption.setValue(1) // The width of the change window (for abrupt drift, set to 1)
-      } else {
-        stream.widthOption.setValue(DRIFT_WIDTH)
-      }
+    var t_ini: Long = 0
 
-      stream.prepareForUse()
-
-      var t_ini: Long = 0
-
-      // First of all, generate the header
-      if(! (HEADER_FILE equals "")) {
-        val header = stream.getHeader.toString
-        val pw = new PrintWriter(new File(HEADER_FILE ))
-        var instance = stream.nextInstance().getData.toString
-        instance = instance.substring(0, instance.length - 1)
-        pw.write(header)
-        pw.write(instance + "\n")
-        pw.close
-        return
-
-      }
-
-      while(stream.hasMoreInstances && instancesSent < MAX_INSTANCES){
-        if(instancesSent % INSTANCE_RATE == 0){
-          t_ini = System.currentTimeMillis()
-        }
-        var instance = stream.nextInstance().getData.toString
-        //instance = instance.substring(0, instance.length - 1)
-        //println(instance)
-        producer.send(new ProducerRecord[Long, String](TOPIC, System.currentTimeMillis(), instance))
-        instancesSent += 1
-
-        val t_end = System.currentTimeMillis()
-        if(instancesSent % INSTANCE_RATE == 0 && (t_end - t_ini) < TIME_INTERVAL){
-          val sleepTime = (t_ini + TIME_INTERVAL) - t_end
-          println("Instances sent: " + instancesSent + ". Sleeping for " + sleepTime + " ms")
-          Thread.sleep(sleepTime)
-        }
-      }
+    // First of all, generate the header
+    if (!(HEADER_FILE equals "")) {
+      val header = stream.getHeader.toString
+      val pw = new PrintWriter(new File(HEADER_FILE))
+      var instance = stream.nextInstance().getData.toString
+      instance = instance.substring(0, instance.length - 1)
+      pw.write(header)
+      pw.write(instance + "\n")
+      pw.close
+      return
 
     }
+
+    while (stream.hasMoreInstances && instancesSent < MAX_INSTANCES) {
+      if (instancesSent % INSTANCE_RATE == 0) {
+        t_ini = System.currentTimeMillis()
+      }
+      val instance = stream.nextInstance().getData.toString
+      //instance = instance.substring(0, instance.length - 1)
+      //println(instance)
+      producer.send(new ProducerRecord[Long, String](TOPIC, System.currentTimeMillis(), instance))
+      instancesSent += 1
+
+      val t_end = System.currentTimeMillis()
+      if (instancesSent % INSTANCE_RATE == 0 && (t_end - t_ini) < TIME_INTERVAL) {
+        val sleepTime = (t_ini + TIME_INTERVAL) - t_end
+        println("Instances sent: " + instancesSent + ". Sleeping for " + sleepTime + " ms")
+        Thread.sleep(sleepTime)
+      }
+    }
+
 
   }
 
