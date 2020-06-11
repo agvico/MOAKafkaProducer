@@ -38,6 +38,9 @@ class Main extends Runnable {
   @Option(names = Array("-w"), paramLabel = "NUMBER", description = Array("For gradual drifts, the amount of instances in the transition between generators. Default 10.000 instances"))
   var DRIFT_WIDTH: Int = 10000
 
+  @Option(names = Array("-v"), description = Array("Be verbose."))
+  var VERBOSE: Boolean = false
+
   @Option(names = Array("--abrupt"), description = Array("The drift is abrupt instead of gradual"))
   var abrupt: Boolean = false
 
@@ -126,16 +129,22 @@ class Main extends Runnable {
       if (instancesSent % INSTANCE_RATE == 0) {
         t_ini = System.currentTimeMillis()
       }
-      val instance = stream.nextInstance().getData.toString
-      //instance = instance.substring(0, instance.length - 1)
-      //println(instance)
+
+      val instance: String = stream match {
+        case s: ArffFileStream => {
+          val inst = stream.nextInstance().getData.toString
+          inst.substring(0, inst.length - 1)  // remove last comma
+        }
+        case _ => {stream.nextInstance().getData.toString}
+      }
+
       producer.send(new ProducerRecord[Long, String](TOPIC, System.currentTimeMillis(), instance))
       instancesSent += 1
 
       val t_end = System.currentTimeMillis()
       if (instancesSent % INSTANCE_RATE == 0 && (t_end - t_ini) < TIME_INTERVAL) {
         val sleepTime = (t_ini + TIME_INTERVAL) - t_end
-        println("Instances sent: " + instancesSent + ". Sleeping for " + sleepTime + " ms")
+        if(VERBOSE) println("Instances sent: " + instancesSent + ". Sleeping for " + sleepTime + " ms")
         Thread.sleep(sleepTime)
       }
     }
