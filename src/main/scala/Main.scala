@@ -132,10 +132,21 @@ class Main extends Runnable {
 
       val instance: String = stream match {
         case s: ArffFileStream => {
-          val inst = stream.nextInstance().getData.toString
-          inst.substring(0, inst.length - 1)  // remove last comma
+          stream.nextInstance()
+            .getData
+            .toDoubleArray
+            .foldLeft(new StringBuilder)((x, v) => x append v append ",")
+            .dropRight(1)  // remove last comma
+            .toString()
         }
-        case _ => {stream.nextInstance().getData.toString}
+        case _ => { // TODO: change this behaviour
+          stream.nextInstance()
+            .getData
+            .toDoubleArray.
+            foldLeft(new StringBuilder)((x, v) => x append v append ",")
+            .dropRight(1)
+            .toString()
+        }
       }
 
       producer.send(new ProducerRecord[Long, String](TOPIC, System.currentTimeMillis(), instance))
